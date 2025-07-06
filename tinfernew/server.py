@@ -19,8 +19,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("错误: 必须设置 BOT_TOKEN 环境变量")
 
+PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL") # 用于设置 webhook
+
 # --- 内存中的任务存储 ---
-# 这是一个简化的任务数据库，用于跟踪任务状态
 JOBS = {}
 
 # --- Pydantic 模型定义 API 的数据结构 ---
@@ -135,10 +136,13 @@ def health_check():
     """根路径，用于健康检查"""
     return {"status": "ok", "service": "Telebot Dispatch Center"}
 
-# --- 在应用启动时设置 Webhook ---
+# --- 在应用启动和关闭时运行的生命周期事件 ---
 @app.on_event("startup")
 async def startup_event():
-    PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL")
+    """应用启动时运行"""
+    # 【关键修复】在设置 webhook 之前，必须先初始化应用
+    await telegram_app.initialize()
+
     if not PUBLIC_SERVER_URL:
         logger.warning("警告: PUBLIC_SERVER_URL 环境变量未设置，无法自动设置Webhook。")
         return
@@ -149,6 +153,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("正在移除 Webhook...")
-    await telegram_app.bot.delete_webhook()
-
+    """应用关闭时运行"""
+    logger.info("正在移除 Webhook 并关闭应用...")
+    # 【关键修复】在关闭时，也需要调用 shutdown
+    await telegram_app.shutdown()
