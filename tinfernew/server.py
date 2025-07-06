@@ -33,11 +33,7 @@ class TaskUpdateRequest(BaseModel):
 # --- FastAPI 应用实例 ---
 app = FastAPI()
 
-# --- Telegram Bot 设置 ---
-# 使用 Application.builder() 创建应用实例
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-# --- 辅助函数 ---
+# --- 辅助函数和命令处理器 (保持不变) ---
 def send_telegram_message(chat_id: int, text: str):
     """一个辅助函数，用于向指定的Telegram用户发送消息。"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -49,7 +45,6 @@ def send_telegram_message(chat_id: int, text: str):
     except Exception as e:
         logger.error(f"发送消息时发生未知错误: {e}")
 
-# --- Telegram 命令处理器 ---
 async def start_command(update: Update, context: CallbackContext):
     """处理 /start 命令"""
     welcome_text = (
@@ -89,21 +84,43 @@ async def vtuber_command(update: Update, context: CallbackContext):
     )
     logger.info(f"任务已提交: {job_id} for chat_id {update.effective_chat.id}")
 
-# --- 将命令处理器注册到 Telegram 应用 ---
+
+# --- 【关键修复】重构 Telegram Bot 设置逻辑 ---
+
+async def post_init(application: Application) -> None:
+    """
+    这个函数会在 Application.initialize() 成功后被自动调用。
+    我们在这里设置 Webhook，确保万无一失。
+    """
+    if not PUBLIC_SERVER_URL:
+        logger.warning("警告: PUBLIC_SERVER_URL 环境变量未设置，无法自动设置Webhook。")
+        return
+    
+    webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
+    logger.info(f"正在通过 post_init 设置 Webhook 到: {webhook_url}")
+    await application.bot.set_webhook(url=webhook_url)
+
+# 使用 post_init 钩子来构建应用实例
+telegram_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+# 注册命令处理器
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
+
 
 # --- FastAPI Webhook 端点 ---
 @app.post(f"/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
     """这个端点接收来自Telegram的更新"""
-    update_data = await request.json()
-    update = Update.de_json(update_data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    # 在处理更新前，确保应用已初始化
+    await telegram_app.update_queue.put(
+        Update.de_json(data=await request.json(), bot=telegram_app.bot)
+    )
     return Response(status_code=200)
 
-# --- 为 Worker 提供的 API 端点 ---
+
+# --- 为 Worker 提供的 API 端点 (保持不变) ---
 @app.get("/api/get-task")
 async def get_task():
     """由本地Worker调用，获取一个待处理的任务"""
@@ -136,24 +153,21 @@ def health_check():
     """根路径，用于健康检查"""
     return {"status": "ok", "service": "Telebot Dispatch Center"}
 
+
 # --- 在应用启动和关闭时运行的生命周期事件 ---
 @app.on_event("startup")
 async def startup_event():
-    """应用启动时运行"""
-    # 【关键修复】在设置 webhook 之前，必须先初始化应用
+    """应用启动时运行，现在只负责初始化和启动轮询"""
+    # 我们现在只调用 initialize，set_webhook 的工作交给了 post_init
     await telegram_app.initialize()
-
-    if not PUBLIC_SERVER_URL:
-        logger.warning("警告: PUBLIC_SERVER_URL 环境变量未设置，无法自动设置Webhook。")
-        return
-    
-    webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
-    logger.info(f"正在设置 Webhook 到: {webhook_url}")
-    await telegram_app.bot.set_webhook(url=webhook_url)
+    # 启动后台轮询来处理 update_queue 中的更新
+    await telegram_app.start()
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭时运行"""
-    logger.info("正在移除 Webhook 并关闭应用...")
-    # 【关键修复】在关闭时，也需要调用 shutdown
+    logger.info("正在停止轮询并关闭应用...")
+    # 停止后台轮询
+    await telegram_app.stop()
+    # 调用 shutdown 来清理资源
     await telegram_app.shutdown()
