@@ -2,7 +2,6 @@ import os
 import uuid
 import logging
 import httpx
-import asyncio
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
 from telegram import Update
@@ -84,12 +83,10 @@ async def vtuber_command(update: Update, context: CallbackContext):
 @app.post(f"/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
     """这个端点接收来自Telegram的更新"""
-    if telegram_app and telegram_app.initialized:
+    if telegram_app:
         await telegram_app.update_queue.put(
             Update.de_json(data=await request.json(), bot=telegram_app.bot)
         )
-    else:
-        logger.warning("收到 Webhook 请求，但 Telegram 应用尚未初始化。")
     return Response(status_code=200)
 
 @app.get("/api/get-task")
@@ -121,47 +118,45 @@ async def update_task(update: TaskUpdateRequest):
 def health_check():
     return {"status": "ok", "service": "Telebot Dispatch Center"}
 
-# --- 【关键修复】重构生命周期事件，增加详细日志 ---
-async def setup_bot():
-    """一个独立的函数来设置和初始化机器人，方便调试"""
-    global telegram_app
-    
-    try:
-        logger.info("[1/5] 正在创建 Telegram Application 实例...")
-        telegram_app = Application.builder().token(BOT_TOKEN).build()
-        
-        telegram_app.add_handler(CommandHandler("start", start_command))
-        telegram_app.add_handler(CommandHandler("help", help_command))
-        telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
-        logger.info("[2/5] 命令处理器已注册。")
-
-        logger.info("[3/5] 正在初始化 Telegram Application...")
-        await telegram_app.initialize()
-        logger.info("[3/5] Telegram Application 初始化完成。")
-
-        if not PUBLIC_SERVER_URL:
-            logger.warning("[4/5] 警告: PUBLIC_SERVER_URL 环境变量未设置，跳过 Webhook 设置。")
-        else:
-            webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
-            logger.info(f"[4/5] 正在设置 Webhook 到: {webhook_url}")
-            if await telegram_app.bot.set_webhook(url=webhook_url):
-                logger.info("[4/5] Webhook 设置成功！")
-            else:
-                logger.error("[4/5] Webhook 设置失败！请检查 URL 和 Bot Token。")
-        
-        logger.info("[5/5] 正在启动后台更新处理...")
-        await telegram_app.start()
-        logger.info("[5/5] 后台更新处理已启动。应用完全准备就绪！")
-
-    except Exception as e:
-        logger.error(f"在 setup_bot 过程中发生致命错误: {e}", exc_info=True)
-
-
+# --- 【关键修复】重构生命周期事件 ---
 @app.on_event("startup")
 async def startup_event():
     """应用启动时运行"""
-    # 在后台任务中运行 setup_bot，以避免阻塞 FastAPI 的启动
-    asyncio.create_task(setup_bot())
+    global telegram_app
+    
+    # 1. 创建应用实例
+    logger.info("正在创建 Telegram Application 实例...")
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+    # 2. 注册命令处理器
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("help", help_command))
+    telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
+    logger.info("命令处理器已注册。")
+
+    # 3. 初始化应用
+    logger.info("正在初始化 Telegram Application...")
+    await telegram_app.initialize()
+    logger.info("Telegram Application 初始化完成。")
+
+    # 4. 设置 Webhook
+    if not PUBLIC_SERVER_URL:
+        logger.warning("警告: PUBLIC_SERVER_URL 环境变量未设置，无法自动设置Webhook。")
+    else:
+        webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
+        logger.info(f"正在设置 Webhook 到: {webhook_url}")
+        try:
+            await telegram_app.bot.set_webhook(url=webhook_url)
+            logger.info("Webhook 设置成功！")
+        except Exception as e:
+            logger.error(f"设置 Webhook 时发生致命错误: {e}", exc_info=True)
+            # 即使设置失败，也继续运行，以便我们可以通过 API 调试
+    
+    # 5. 启动后台任务队列处理
+    logger.info("正在启动后台更新处理...")
+    await telegram_app.start()
+    logger.info("后台更新处理已启动。应用完全准备就绪！")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -171,3 +166,4 @@ async def shutdown_event():
         await telegram_app.stop()
         await telegram_app.shutdown()
         logger.info("Telegram Application 已关闭。")
+
