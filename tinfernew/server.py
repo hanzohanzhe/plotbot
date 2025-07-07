@@ -4,8 +4,8 @@ import logging
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackContext
 
 # --- Basic Setup ---
 logging.basicConfig(
@@ -55,7 +55,7 @@ async def start_command(update: Update, context: CallbackContext):
     welcome_text = (
         "Hello! Welcome to the AI Drawing Bot.\n\n"
         "Use `/vtuber <description>` to submit a drawing task.\n"
-        "For example: `/vtuber a silver-haired girl in a cyberpunk jacket`\n\n"
+        "For example: `/vtuber a silver-haired girl in a white shirt`\n\n"
         "Your task will be added to the queue, please wait patiently for it to be processed."
     )
     await update.message.reply_text(welcome_text)
@@ -66,7 +66,8 @@ async def help_command(update: Update, context: CallbackContext):
         "Available commands:\n"
         "/start - Show welcome message\n"
         "/help - Show this help message\n"
-        "/vtuber <description> - Create a VTuber model based on your text description"
+        "/vtuber <description> - Create a VTuber model based on your text description\n"
+        "/dmiu - Contact the bot administrator"
     )
     await update.message.reply_text(help_text)
 
@@ -80,7 +81,7 @@ async def vtuber_command(update: Update, context: CallbackContext):
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
         "prompt": prompt,
-        "chat_id": update.effective_chat.id, # Store chat_id
+        "chat_id": update.effective_chat.id,
         "status": "PENDING"
     }
     send_telegram_message(
@@ -89,10 +90,26 @@ async def vtuber_command(update: Update, context: CallbackContext):
     )
     logger.info(f"Task submitted: {job_id} for chat_id {update.effective_chat.id}")
 
+async def dmiu_command(update: Update, context: CallbackContext):
+    """Handles the /dmiu command to contact the owner."""
+    # Your Telegram username is set here
+    my_telegram_username = "hanzohang"
+    my_telegram_url = f"https://t.me/{my_telegram_username}"
+
+    text = "Hello! Click the button below to start a direct chat with me (the bot administrator)."
+    
+    keyboard = [
+        [InlineKeyboardButton("💬 Start Chat", url=my_telegram_url)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, reply_markup=reply_markup)
+
 # --- Register command handlers with the Telegram application ---
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
+telegram_app.add_handler(CommandHandler("dmiu", dmiu_command)) # New command handler
 
 # --- FastAPI Webhook Endpoint ---
 @app.post(f"/{BOT_TOKEN}")
@@ -111,29 +128,27 @@ async def get_task():
         if task_details["status"] == "PENDING":
             task_details["status"] = "RUNNING"
             logger.info(f"Task assigned to Worker: {job_id}")
-            # Include chat_id when returning the task
             return {
                 "job_id": job_id,
                 "prompt": task_details["prompt"],
-                "chat_id": task_details["chat_id"] # <-- New: return chat_id
+                "chat_id": task_details["chat_id"]
             }
-    return {"job_id": None, "prompt": None, "chat_id": None} # <-- New: also return chat_id when no task
+    return {"job_id": None, "prompt": None, "chat_id": None}
 
 @app.post("/api/update-task")
-async def update_task(update: TaskUpdateRequest):
+async def update_task(update_request: TaskUpdateRequest):
     """Called by the local Worker to update a task's status"""
-    job = JOBS.get(update.job_id)
+    job = JOBS.get(update_request.job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    job["status"] = update.status
-    logger.info(f"Task status updated: {update.job_id} -> {update.status}")
+    job["status"] = update_request.status
+    logger.info(f"Task status updated: {update_request.job_id} -> {update_request.status}")
 
-    if update.status == "COMPLETED":
-        # If the worker successfully sent the file, we can send a confirmation message.
-        send_telegram_message(job["chat_id"], f"🎉 Your task `{update.job_id}` is complete! The file has been sent to you directly by the bot.")
-    elif update.status == "FAILED":
-        send_telegram_message(job["chat_id"], f"Sorry, your task `{update.job_id}` has failed.")
+    if update_request.status == "COMPLETED":
+        send_telegram_message(job["chat_id"], f"🎉 Your task `{update_request.job_id}` is complete! The file has been sent to you directly by the bot.")
+    elif update_request.status == "FAILED":
+        send_telegram_message(job["chat_id"], f"Sorry, your task `{update_request.job_id}` has failed.")
     
     return {"message": "Task status updated"}
 
