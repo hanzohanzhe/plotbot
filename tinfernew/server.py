@@ -31,18 +31,13 @@ if not PUBLIC_SERVER_URL:
     raise ValueError("Error: PUBLIC_SERVER_URL environment variable must be set")
 
 # --- GlobePay Configuration ---
+GLOBEPAY_PARTNER_CODE = os.environ.get("GLOBEPAY_PARTNER_CODE")
 GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL")
-# **NEW CONFIGURATION for Static QR Code Workflow**
-# The URL where you have hosted the static QR code image.
-STATIC_QR_CODE_URL = os.environ.get("STATIC_QR_CODE_URL") 
-# The price for display purposes (e.g., "0.99")
-PRICE_DISPLAY = os.environ.get("PRICE_DISPLAY", "0.99") 
-# The price in the smallest currency unit (e.g., 99 for 0.99 RMB) for validation
-PRICE_IN_CENTS = os.environ.get("PRICE_IN_CENTS", "99") 
+PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "0.99") 
 PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "CNY")
 
-if not GLOBEPAY_CREDENTIAL or not STATIC_QR_CODE_URL:
-    raise ValueError("Error: GLOBEPAY_CREDENTIAL and STATIC_QR_CODE_URL must be set")
+if not GLOBEPAY_PARTNER_CODE or not GLOBEPAY_CREDENTIAL:
+    raise ValueError("Error: GLOBEPAY_PARTNER_CODE and GLOBEPAY_CREDENTIAL must be set")
 
 # --- In-memory job storage ---
 JOBS = {}
@@ -61,13 +56,73 @@ telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 # --- GlobePay Helper Functions ---
 def generate_globepay_signature(params: dict, credential: str) -> str:
-    """Generates a signature for validating incoming notifications."""
+    """Generates an API request signature according to GlobePay documentation."""
     filtered_params = {k: v for k, v in params.items() if v and k != 'sign'}
     sorted_params = sorted(filtered_params.items())
     unsigned_string = "&".join([f"{k}={v}" for k, v in sorted_params])
     string_to_sign = f"{unsigned_string}&key={credential}"
-    logger.info(f"Validating signature with string: {string_to_sign}")
+    
+    logger.info(f"String to be signed: {string_to_sign}")
+    
     return hashlib.md5(string_to_sign.encode('utf-8')).hexdigest().upper()
+
+def generate_nonce_str() -> str:
+    """Generates a 32-character uppercase alphanumeric random string."""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
+
+async def create_payment_qr(job_id: str) -> str | None:
+    """
+    Calls GlobePay's "Native QR Code Payment" API.
+    This is the most robust method for this use case.
+    """
+    # **DEFINITIVE FIX**: Use the correct "Native QR Code Payment" API endpoint.
+    globepay_api_url = "https://pay.globepay.co/api/v1.0/gateway/qrcode_payment"
+    notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
+    
+    try:
+        # Convert price from float string (e.g., "0.99") to integer in cents (e.g., 99).
+        price_in_smallest_unit = int(float(PRICE_AMOUNT) * 100)
+    except ValueError:
+        logger.error(f"Invalid PRICE_AMOUNT format: {PRICE_AMOUNT}. It should be a number string like '0.99'.")
+        return None
+
+    params = {
+        "partner_code": GLOBEPAY_PARTNER_CODE,
+        "time": str(int(time.time() * 1000)),
+        "nonce_str": generate_nonce_str(),
+        # Use the correct parameter names for this API endpoint
+        "out_trade_no": job_id,
+        "total_fee": str(price_in_smallest_unit),
+        "currency": PRICE_CURRENCY,
+        "description": "AI Drawing Task",
+        "notify_url": notify_url,
+    }
+    
+    params['sign'] = generate_globepay_signature(params, GLOBEPAY_CREDENTIAL)
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Use POST method with JSON body as required by this API endpoint
+            response = await client.post(globepay_api_url, json=params, timeout=30)
+            
+            data = response.json()
+            
+            logger.info(f"GlobePay API Response for job {job_id}: STATUS={response.status_code}, BODY={data}")
+
+            response.raise_for_status()
+            
+            if data.get("result_code") == "SUCCESS":
+                # The QR code data is in the 'code_url' field
+                return data.get("code_url")
+            else:
+                logger.error(f"GlobePay returned a non-SUCCESS result_code for job {job_id}: {data.get('err_code_des')}")
+                return None
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP Error calling GlobePay API for job {job_id}: {e.response.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Unknown Error calling GlobePay API for job {job_id}: {e}", exc_info=True)
+        return None
 
 # --- Telegram Helper Functions ---
 async def send_telegram_message(chat_id: int, text: str, reply_markup=None):
@@ -76,6 +131,18 @@ async def send_telegram_message(chat_id: int, text: str, reply_markup=None):
         await telegram_app.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown', reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Error sending message to chat_id {chat_id}: {e}")
+
+async def send_qr_code_image(chat_id: int, qr_data: str, caption: str):
+    """Generates and sends a QR code image."""
+    try:
+        img = qrcode.make(qr_data)
+        bio = BytesIO()
+        bio.name = 'payment_qr.png'
+        img.save(bio, 'PNG')
+        bio.seek(0)
+        await telegram_app.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+    except Exception as e:
+        logger.error(f"Error sending QR code to chat_id {chat_id}: {e}")
 
 # --- Telegram Command Handlers ---
 async def start_command(update: Update, context: CallbackContext):
@@ -100,50 +167,40 @@ async def help_command(update: Update, context: CallbackContext):
     await update.message.reply_text(help_text)
 
 async def vtuber_command(update: Update, context: CallbackContext):
-    """Handles the /vtuber command, now sends a static QR code."""
+    """Handles the /vtuber command to create a new task and initiate payment"""
     prompt = " ".join(context.args)
     if not prompt:
         await update.message.reply_text("Please provide a description. For example: `/vtuber a girl wearing a cat-ear hat`")
         return
 
-    job_id = str(uuid.uuid4()).replace('-', '')[:16] # A shorter, more user-friendly ID
+    job_id = str(uuid.uuid4()).replace('-', '')
     chat_id = update.effective_chat.id
     
-    # Store the job, waiting for payment confirmation
-    JOBS[job_id] = {
-        "prompt": prompt,
-        "chat_id": chat_id,
-        "status": "AWAITING_PAYMENT"
-    }
-    logger.info(f"Job {job_id} created for chat_id {chat_id}, awaiting payment.")
+    await update.message.reply_text("Creating your payment order, please wait...")
 
-    # Send the static QR code and payment instructions
-    payment_caption = (
-        f"✅ Your task has been created!\n\n"
-        f"To proceed, please use Alipay to scan the QR code below.\n\n"
-        f"**IMPORTANT INSTRUCTIONS:**\n"
-        f"1. You **MUST** pay the exact amount of **{PRICE_DISPLAY} {PRICE_CURRENCY}**.\n"
-        f"2. You **MUST** enter the following Task ID into the payment **remarks/notes** field:\n\n"
-        f"`{job_id}`\n\n"
-        f"(You can tap to copy the ID)\n\n"
-        f"Failure to follow these instructions will result in payment failure and your task will not be processed."
-    )
-    
-    try:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=STATIC_QR_CODE_URL,
-            caption=payment_caption,
-            parse_mode='Markdown'
+    qr_code_url = await create_payment_qr(job_id)
+
+    if qr_code_url:
+        JOBS[job_id] = {
+            "prompt": prompt,
+            "chat_id": chat_id,
+            "status": "AWAITING_PAYMENT"
+        }
+        
+        payment_caption = (
+            f"✅ Your order has been created! Please scan the QR code below to complete the payment.\n\n"
+            f"💰 **Amount: {PRICE_AMOUNT} {PRICE_CURRENCY}**\n"
+            f"📝 **Your Task:** {prompt}\n"
+            f"🆔 **Order ID:** `{job_id}`\n\n"
+            f"Once payment is successful, your task will automatically be queued for processing."
         )
-    except Exception as e:
-        logger.error(f"Failed to send static QR code photo: {e}")
-        await send_telegram_message(chat_id, "Error: Could not display the payment QR code. Please contact an administrator.")
+        await send_qr_code_image(chat_id, qr_code_url, payment_caption)
+        logger.info(f"Payment order created for job {job_id} for chat_id {chat_id}")
+    else:
+        await send_telegram_message(chat_id, "❌ Sorry, we failed to create a payment order. Please try again later or contact an administrator.")
 
-# This is the function for the /dmiu command
 async def dmiu_command(update: Update, context: CallbackContext):
     """Handles the /dmiu command to contact the owner."""
-    # IMPORTANT: Replace "hanzohang" with your actual Telegram username
     my_telegram_username = "hanzohang"
     my_telegram_url = f"https://t.me/{my_telegram_username}"
     text = "Hello! Click the button below to start a direct chat with me (the bot administrator)."
@@ -155,7 +212,6 @@ async def dmiu_command(update: Update, context: CallbackContext):
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
-# Make sure the /dmiu command handler is registered
 telegram_app.add_handler(CommandHandler("dmiu", dmiu_command))
 
 # --- FastAPI Webhook Endpoint ---
@@ -170,49 +226,36 @@ async def telegram_webhook(request: Request):
 # --- API Endpoint for GlobePay Payment Notifications ---
 @app.post("/api/payment-notify")
 async def payment_notify(request: Request):
-    """
-    This endpoint receives ALL payment success notifications from GlobePay
-    and processes them based on the amount and description.
-    """
+    """This endpoint receives payment success notifications from GlobePay."""
     try:
         data = await request.json()
         logger.info(f"Received GlobePay notification: {data}")
 
-        # --- 1. Validate Signature ---
         params_to_validate = data.copy()
         received_sign = params_to_validate.pop('sign', None)
+        
         if generate_globepay_signature(params_to_validate, GLOBEPAY_CREDENTIAL) != received_sign:
             logger.warning(f"GlobePay notification signature validation failed: {data}")
             raise HTTPException(status_code=400, detail="Invalid signature")
 
-        # --- 2. Validate Payment Amount ---
-        paid_amount = str(data.get("total_fee", "0"))
-        if paid_amount != PRICE_IN_CENTS:
-            logger.warning(f"Received payment with incorrect amount. Expected {PRICE_IN_CENTS}, got {paid_amount}. Ignoring.")
-            return {"result": "success"} # Tell GlobePay we're done
+        # The order ID from the notification is in the 'out_trade_no' field for this API
+        order_id = data.get('out_trade_no')
+        job = JOBS.get(order_id)
 
-        # --- 3. Extract Job ID from Remarks ---
-        # We assume the user correctly entered the job_id in the description field.
-        job_id = data.get("description")
-        if not job_id:
-            logger.warning(f"Received valid payment but description (remark) is empty. Cannot process. Payload: {data}")
-            return {"result": "success"}
-
-        # --- 4. Find and Update Job ---
-        job = JOBS.get(job_id)
         if not job:
-            logger.error(f"Received payment for a non-existent or already processed job: {job_id}")
+            logger.error(f"Received notification for a non-existent or already processed job: {order_id}")
             return {"result": "success"}
 
         if job["status"] == "AWAITING_PAYMENT":
             job["status"] = "PENDING"
-            logger.info(f"Payment successful for job {job_id}. Status updated to PENDING.")
+            logger.info(f"Payment successful for job {order_id}. Status updated to PENDING.")
+            
             await send_telegram_message(
                 job["chat_id"],
-                f"🎉 Payment of {PRICE_DISPLAY} {PRICE_CURRENCY} for task `{job_id}` confirmed!\n\nYour task is now in the queue to be processed."
+                f"🎉 Payment successful!\n\nYour task `{order_id}` is now in the queue to be processed."
             )
         else:
-            logger.warning(f"Received duplicate payment notification for job: {job_id}, current status: {job['status']}")
+            logger.warning(f"Received duplicate notification for job: {order_id}, current status: {job['status']}")
 
         return {"result": "success"}
     except Exception as e:
