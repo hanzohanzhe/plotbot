@@ -71,24 +71,30 @@ def generate_nonce_str() -> str:
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
 
 async def create_payment_qr(job_id: str) -> str | None:
-    """Calls GlobePay API to create a new payment order and returns the QR code content."""
-    globepay_api_url = f"https://pay.globepay.co/api/v1.0/gateway/partners/{GLOBEPAY_PARTNER_CODE}/orders/{job_id}"
+    """
+    Calls GlobePay's "Native QR Code Payment" API.
+    This is the most robust method for this use case.
+    """
+    # **DEFINITIVE FIX**: Use the correct "Native QR Code Payment" API endpoint.
+    globepay_api_url = "https://pay.globepay.co/api/v1.0/gateway/qrcode_payment"
     notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
     
     try:
+        # Convert price from float string (e.g., "1.00") to integer in cents (e.g., 100).
         price_in_smallest_unit = int(float(PRICE_AMOUNT) * 100)
     except ValueError:
         logger.error(f"Invalid PRICE_AMOUNT format: {PRICE_AMOUNT}. It should be a number string like '1.00'.")
         return None
 
     params = {
+        "partner_code": GLOBEPAY_PARTNER_CODE,
         "time": str(int(time.time() * 1000)),
         "nonce_str": generate_nonce_str(),
-        "price": str(price_in_smallest_unit),
+        # Use the correct parameter names for this API endpoint
+        "out_trade_no": job_id,
+        "total_fee": str(price_in_smallest_unit),
         "currency": PRICE_CURRENCY,
-        # **DEFINITIVE FIX**: Use a single, simple, ASCII word for the description
-        # to completely eliminate any possible encoding issues with spaces or special characters.
-        "description": "Task",
+        "description": "AI Drawing Task",
         "notify_url": notify_url,
     }
     
@@ -96,7 +102,8 @@ async def create_payment_qr(job_id: str) -> str | None:
     
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.put(globepay_api_url, data=params, timeout=30)
+            # Use POST method as required by this API endpoint
+            response = await client.post(globepay_api_url, json=params, timeout=30)
             
             data = response.json()
             
@@ -105,9 +112,10 @@ async def create_payment_qr(job_id: str) -> str | None:
             response.raise_for_status()
             
             if data.get("result_code") == "SUCCESS":
+                # The QR code data is in the 'code_url' field
                 return data.get("code_url")
             else:
-                logger.error(f"GlobePay returned a non-SUCCESS result_code for job {job_id}.")
+                logger.error(f"GlobePay returned a non-SUCCESS result_code for job {job_id}: {data.get('err_code_des')}")
                 return None
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP Error calling GlobePay API for job {job_id}: {e.response.text}")
@@ -230,7 +238,8 @@ async def payment_notify(request: Request):
             logger.warning(f"GlobePay notification signature validation failed: {data}")
             raise HTTPException(status_code=400, detail="Invalid signature")
 
-        order_id = data.get('order_id')
+        # The order ID from the notification is in the 'out_trade_no' field for this API
+        order_id = data.get('out_trade_no')
         job = JOBS.get(order_id)
 
         if not job:
@@ -243,7 +252,7 @@ async def payment_notify(request: Request):
             
             await send_telegram_message(
                 job["chat_id"],
-                f"🎉 Payment successful!\n\nYour task `{job_id}` is now in the queue to be processed."
+                f"🎉 Payment successful!\n\nYour task `{order_id}` is now in the queue to be processed."
             )
         else:
             logger.warning(f"Received duplicate notification for job: {order_id}, current status: {job['status']}")
