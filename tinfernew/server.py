@@ -5,7 +5,7 @@ import httpx
 import time
 import hashlib
 import random
-import string # <-- Import the string module
+import string
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -85,7 +85,10 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.put(globepay_api_url, json=params, timeout=30)
+            # **BUG FIX**: Send data as application/x-www-form-urlencoded, not as JSON.
+            # This is the crucial change that matches the GlobePay API documentation.
+            response = await client.put(globepay_api_url, data=params, timeout=30)
+            
             data = response.json()
             
             logger.info(f"GlobePay API Response for job {job_id}: STATUS={response.status_code}, BODY={data}")
@@ -153,7 +156,6 @@ async def vtuber_command(update: Update, context: CallbackContext):
         await update.message.reply_text("Please provide a description. For example: `/vtuber a girl wearing a cat-ear hat`")
         return
 
-    # **BUG FIX**: Generate a UUID and remove hyphens to create a clean order_id.
     job_id = str(uuid.uuid4()).replace('-', '')
     
     chat_id = update.effective_chat.id
