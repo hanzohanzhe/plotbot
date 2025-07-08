@@ -73,7 +73,6 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
     
     params = {
-        # **BUG FIX**: Convert timestamp from seconds to milliseconds as required by GlobePay API.
         "time": str(int(time.time() * 1000)),
         "nonce_str": generate_nonce_str(),
         "price": PRICE_AMOUNT,
@@ -86,7 +85,6 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     
     try:
         async with httpx.AsyncClient() as client:
-            # Send data as application/x-www-form-urlencoded, not as JSON.
             response = await client.put(globepay_api_url, data=params, timeout=30)
             
             data = response.json()
@@ -157,15 +155,18 @@ async def vtuber_command(update: Update, context: CallbackContext):
         return
 
     job_id = str(uuid.uuid4()).replace('-', '')
-    
     chat_id = update.effective_chat.id
     
     await update.message.reply_text("Creating your payment order, please wait...")
-    qr_code_url = await create_payment_qr(job_id, prompt)
+
+    # **BUG FIX**: Use a safe, generic, ASCII-only description for the payment
+    # to avoid signature errors caused by special characters in the user's prompt.
+    payment_description = f"AI Drawing Task: {job_id}"
+    qr_code_url = await create_payment_qr(job_id, payment_description)
 
     if qr_code_url:
         JOBS[job_id] = {
-            "prompt": prompt,
+            "prompt": prompt, # The original prompt is still saved for the worker
             "chat_id": chat_id,
             "status": "AWAITING_PAYMENT"
         }
@@ -173,8 +174,8 @@ async def vtuber_command(update: Update, context: CallbackContext):
         payment_caption = (
             f"✅ Your order has been created! Please scan the QR code below to complete the payment.\n\n"
             f"💰 **Amount: {PRICE_AMOUNT} {PRICE_CURRENCY}**\n"
-            f"📝 **Description:** {prompt}\n"
-            f"🆔 **Task ID:** `{job_id}`\n\n"
+            f"📝 **Your Task:** {prompt}\n"
+            f"🆔 **Order ID:** `{job_id}`\n\n"
             f"Once payment is successful, your task will automatically be queued for processing."
         )
         await send_qr_code_image(chat_id, qr_code_url, payment_caption)
