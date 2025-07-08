@@ -1,270 +1,229 @@
-import os
-import uuid
-import logging
-import httpx
-import time
-import hashlib
-import random
-import string
-from fastapi import FastAPI, Request, Response, HTTPException
-from pydantic import BaseModel
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackContext
-from urllib.parse import urlencode
-import qrcode
-from io import BytesIO
+回退至无支付功能版本的指南
 
-# --- Basic Setup ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+本指南将指导您如何将服务器上的应用，安全地恢复到最初的、不包含任何支付功能的稳定版本。
+第一步：在 GitHub 上更新 server.py 文件
 
-# --- Load configuration from environment variables ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("Error: BOT_TOKEN environment variable must be set")
+这是最关键的一步。我们需要将您仓库中的 server.py 文件内容，替换为最初的、最简单的版本。
 
-PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL")
-if not PUBLIC_SERVER_URL:
-    raise ValueError("Error: PUBLIC_SERVER_URL environment variable must be set")
+    请在浏览器中打开您 GitHub 仓库里的 plotbot/tinfernew/server.py 文件，并点击“编辑”按钮。
 
-# --- GlobePay Configuration ---
-GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL")
-# **NEW CONFIGURATION for Static QR Code Workflow**
-# The URL where you have hosted the static QR code image.
-STATIC_QR_CODE_URL = os.environ.get("STATIC_QR_CODE_URL") 
-# The price for display purposes (e.g., "0.99")
-PRICE_DISPLAY = os.environ.get("PRICE_DISPLAY", "0.99") 
-# The price in the smallest currency unit (e.g., 99 for 0.99 RMB) for validation
-PRICE_IN_CENTS = os.environ.get("PRICE_IN_CENTS", "99") 
-PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "CNY")
+    删除里面的所有旧代码。
 
-if not GLOBEPAY_CREDENTIAL or not STATIC_QR_CODE_URL:
-    raise ValueError("Error: GLOBEPAY_CREDENTIAL and STATIC_QR_CODE_URL must be set")
+    将以下这份原始版本的代码完整地粘贴进去：
 
-# --- In-memory job storage ---
-JOBS = {}
+    import os
+    import uuid
+    import logging
+    import httpx
+    from fastapi import FastAPI, Request, Response, HTTPException
+    from pydantic import BaseModel
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import Application, CommandHandler, CallbackContext
 
-# --- Pydantic model defines the API's data structure ---
-class TaskUpdateRequest(BaseModel):
-    job_id: str
-    status: str
-    result_url: str | None = None
-
-# --- FastAPI application instance ---
-app = FastAPI()
-
-# --- Telegram Bot Setup ---
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-
-# --- GlobePay Helper Functions ---
-def generate_globepay_signature(params: dict, credential: str) -> str:
-    """Generates a signature for validating incoming notifications."""
-    filtered_params = {k: v for k, v in params.items() if v and k != 'sign'}
-    sorted_params = sorted(filtered_params.items())
-    unsigned_string = "&".join([f"{k}={v}" for k, v in sorted_params])
-    string_to_sign = f"{unsigned_string}&key={credential}"
-    logger.info(f"Validating signature with string: {string_to_sign}")
-    return hashlib.md5(string_to_sign.encode('utf-8')).hexdigest().upper()
-
-# --- Telegram Helper Functions ---
-async def send_telegram_message(chat_id: int, text: str, reply_markup=None):
-    """A helper function to send a message to a specified Telegram user."""
-    try:
-        await telegram_app.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown', reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"Error sending message to chat_id {chat_id}: {e}")
-
-# --- Telegram Command Handlers ---
-async def start_command(update: Update, context: CallbackContext):
-    """Handles the /start command"""
-    welcome_text = (
-        "Hello! Welcome to the AI Drawing Bot.\n\n"
-        "Use `/vtuber <description>` to submit a drawing task.\n"
-        "For example: `/vtuber a silver-haired girl in a white shirt`\n\n"
-        "After submitting, you will be prompted for payment to start the task."
+    # --- Basic Setup ---
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    await update.message.reply_text(welcome_text)
+    logger = logging.getLogger(__name__)
 
-async def help_command(update: Update, context: CallbackContext):
-    """Handles the /help command"""
-    help_text = (
-        "Available commands:\n"
-        "/start - Show welcome message\n"
-        "/help - Show this help message\n"
-        "/vtuber <description> - Create a VTuber model based on your text description\n"
-        "/dmiu - Contact the bot administrator"
-    )
-    await update.message.reply_text(help_text)
+    # --- Load configuration from environment variables ---
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    if not BOT_TOKEN:
+        raise ValueError("Error: BOT_TOKEN environment variable must be set")
 
-async def vtuber_command(update: Update, context: CallbackContext):
-    """Handles the /vtuber command, now sends a static QR code."""
-    prompt = " ".join(context.args)
-    if not prompt:
-        await update.message.reply_text("Please provide a description. For example: `/vtuber a girl wearing a cat-ear hat`")
-        return
+    PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL") # Used to set the webhook
 
-    job_id = str(uuid.uuid4()).replace('-', '')[:16] # A shorter, more user-friendly ID
-    chat_id = update.effective_chat.id
-    
-    # Store the job, waiting for payment confirmation
-    JOBS[job_id] = {
-        "prompt": prompt,
-        "chat_id": chat_id,
-        "status": "AWAITING_PAYMENT"
-    }
-    logger.info(f"Job {job_id} created for chat_id {chat_id}, awaiting payment.")
+    # --- In-memory job storage ---
+    JOBS = {}
 
-    # Send the static QR code and payment instructions
-    payment_caption = (
-        f"✅ Your task has been created!\n\n"
-        f"To proceed, please use Alipay to scan the QR code below.\n\n"
-        f"**IMPORTANT INSTRUCTIONS:**\n"
-        f"1. You **MUST** pay the exact amount of **{PRICE_DISPLAY} {PRICE_CURRENCY}**.\n"
-        f"2. You **MUST** enter the following Task ID into the payment **remarks/notes** field:\n\n"
-        f"`{job_id}`\n\n"
-        f"(You can tap to copy the ID)\n\n"
-        f"Failure to follow these instructions will result in payment failure and your task will not be processed."
-    )
-    
-    try:
-        await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=STATIC_QR_CODE_URL,
-            caption=payment_caption,
-            parse_mode='Markdown'
+    # --- Pydantic model defines the API's data structure ---
+    class TaskUpdateRequest(BaseModel):
+        job_id: str
+        status: str
+        result_url: str | None = None # Kept for compatibility, can be null
+
+    # --- FastAPI application instance ---
+    app = FastAPI()
+
+    # --- Telegram Bot Setup ---
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+    # --- Helper Function ---
+    def send_telegram_message(chat_id: int, text: str):
+        """A helper function to send a message to a specified Telegram user."""
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        try:
+            response = httpx.post(url, json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}, timeout=30)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Error sending message to chat_id {chat_id}: {e.response.text}")
+        except Exception as e:
+            logger.error(f"An unknown error occurred while sending message: {e}")
+
+    # --- Telegram Command Handlers ---
+    async def start_command(update: Update, context: CallbackContext):
+        """Handles the /start command"""
+        welcome_text = (
+            "Hello! Welcome to the AI Drawing Bot.\n\n"
+            "Use `/vtuber <description>` to submit a drawing task.\n"
+            "For example: `/vtuber a silver-haired girl in a white shirt`\n\n"
+            "Your task will be added to the queue, please wait patiently for it to be processed."
         )
-    except Exception as e:
-        logger.error(f"Failed to send static QR code photo: {e}")
-        await send_telegram_message(chat_id, "Error: Could not display the payment QR code. Please contact an administrator.")
+        await update.message.reply_text(welcome_text)
 
+    async def help_command(update: Update, context: CallbackContext):
+        """Handles the /help command"""
+        help_text = (
+            "Available commands:\n"
+            "/start - Show welcome message\n"
+            "/help - Show this help message\n"
+            "/vtuber <description> - Create a VTuber model based on your text description\n"
+            "/dmiu - Contact the bot administrator"
+        )
+        await update.message.reply_text(help_text)
 
-async def dmiu_command(update: Update, context: CallbackContext):
-    """Handles the /dmiu command to contact the owner."""
-    my_telegram_username = "hanzohang"
-    my_telegram_url = f"https://t.me/{my_telegram_username}"
-    text = "Hello! Click the button below to start a direct chat with me (the bot administrator)."
-    keyboard = [[InlineKeyboardButton("💬 Start Chat", url=my_telegram_url)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, reply_markup=reply_markup)
+    async def vtuber_command(update: Update, context: CallbackContext):
+        """Handles the /vtuber command to create a new task"""
+        prompt = " ".join(context.args)
+        if not prompt:
+            await update.message.reply_text("Please enter your description. For example: `/vtuber a girl wearing a cat-ear hat`")
+            return
 
-# --- Register command handlers ---
-telegram_app.add_handler(CommandHandler("start", start_command))
-telegram_app.add_handler(CommandHandler("help", help_command))
-telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
-telegram_app.add_handler(CommandHandler("dmiu", dmiu_command))
+        job_id = str(uuid.uuid4())
+        JOBS[job_id] = {
+            "prompt": prompt,
+            "chat_id": update.effective_chat.id,
+            "status": "PENDING"
+        }
+        send_telegram_message(
+            update.effective_chat.id,
+            f"✅ Task submitted successfully, now waiting in the queue for a compute node...\n\nTask ID: `{job_id}`"
+        )
+        logger.info(f"Task submitted: {job_id} for chat_id {update.effective_chat.id}")
 
-# --- FastAPI Webhook Endpoint ---
-@app.post(f"/{BOT_TOKEN}")
-async def telegram_webhook(request: Request):
-    """This endpoint receives updates from Telegram"""
-    update_data = await request.json()
-    update = Update.de_json(update_data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return Response(status_code=200)
+    async def dmiu_command(update: Update, context: CallbackContext):
+        """Handles the /dmiu command to contact the owner."""
+        my_telegram_username = "hanzohang"
+        my_telegram_url = f"https://t.me/{my_telegram_username}"
 
-# --- API Endpoint for GlobePay Payment Notifications ---
-@app.post("/api/payment-notify")
-async def payment_notify(request: Request):
-    """
-    This endpoint receives ALL payment success notifications from GlobePay
-    and processes them based on the amount and description.
-    """
-    try:
-        data = await request.json()
-        logger.info(f"Received GlobePay notification: {data}")
+        text = "Hello! Click the button below to start a direct chat with me (the bot administrator)."
 
-        # --- 1. Validate Signature ---
-        params_to_validate = data.copy()
-        received_sign = params_to_validate.pop('sign', None)
-        if generate_globepay_signature(params_to_validate, GLOBEPAY_CREDENTIAL) != received_sign:
-            logger.warning(f"GlobePay notification signature validation failed: {data}")
-            raise HTTPException(status_code=400, detail="Invalid signature")
+        keyboard = [
+            [InlineKeyboardButton("💬 Start Chat", url=my_telegram_url)]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-        # --- 2. Validate Payment Amount ---
-        paid_amount = str(data.get("total_fee", "0"))
-        if paid_amount != PRICE_IN_CENTS:
-            logger.warning(f"Received payment with incorrect amount. Expected {PRICE_IN_CENTS}, got {paid_amount}. Ignoring.")
-            return {"result": "success"} # Tell GlobePay we're done
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
-        # --- 3. Extract Job ID from Remarks ---
-        # We assume the user correctly entered the job_id in the description field.
-        job_id = data.get("description")
-        if not job_id:
-            logger.warning(f"Received valid payment but description (remark) is empty. Cannot process. Payload: {data}")
-            return {"result": "success"}
+    # --- Register command handlers with the Telegram application ---
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("help", help_command))
+    telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
+    telegram_app.add_handler(CommandHandler("dmiu", dmiu_command))
 
-        # --- 4. Find and Update Job ---
-        job = JOBS.get(job_id)
+    # --- FastAPI Webhook Endpoint ---
+    @app.post(f"/{BOT_TOKEN}")
+    async def telegram_webhook(request: Request):
+        """This endpoint receives updates from Telegram"""
+        update_data = await request.json()
+        update = Update.de_json(update_data, telegram_app.bot)
+        await telegram_app.process_update(update)
+        return Response(status_code=200)
+
+    # --- API Endpoint for Workers ---
+    @app.get("/api/get-task")
+    async def get_task():
+        """Called by the local Worker to get a pending task"""
+        for job_id, task_details in JOBS.items():
+            if task_details["status"] == "PENDING":
+                task_details["status"] = "RUNNING"
+                logger.info(f"Task assigned to Worker: {job_id}")
+                return {
+                    "job_id": job_id,
+                    "prompt": task_details["prompt"],
+                    "chat_id": task_details["chat_id"]
+                }
+        return {"job_id": None, "prompt": None, "chat_id": None}
+
+    @app.post("/api/update-task")
+    async def update_task(update_request: TaskUpdateRequest):
+        """Called by the local Worker to update a task's status"""
+        job = JOBS.get(update_request.job_id)
         if not job:
-            logger.error(f"Received payment for a non-existent or already processed job: {job_id}")
-            return {"result": "success"}
+            raise HTTPException(status_code=404, detail="Task not found")
 
-        if job["status"] == "AWAITING_PAYMENT":
-            job["status"] = "PENDING"
-            logger.info(f"Payment successful for job {job_id}. Status updated to PENDING.")
-            await send_telegram_message(
-                job["chat_id"],
-                f"🎉 Payment of {PRICE_DISPLAY} {PRICE_CURRENCY} for task `{job_id}` confirmed!\n\nYour task is now in the queue to be processed."
-            )
-        else:
-            logger.warning(f"Received duplicate payment notification for job: {job_id}, current status: {job['status']}")
+        job["status"] = update_request.status
+        logger.info(f"Task status updated: {update_request.job_id} -> {update_request.status}")
 
-        return {"result": "success"}
-    except Exception as e:
-        logger.error(f"Error processing GlobePay notification: {e}")
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        if update_request.status == "COMPLETED":
+            send_telegram_message(job["chat_id"], f"🎉 Your task `{update_request.job_id}` is complete! The file has been sent to you directly by the bot.")
+        elif update_request.status == "FAILED":
+            send_telegram_message(job["chat_id"], f"Sorry, your task `{update_request.job_id}` has failed.")
 
-# --- API Endpoint for Workers ---
-@app.get("/api/get-task")
-async def get_task():
-    """Called by the local Worker to get a pending task"""
-    for job_id, task_details in JOBS.items():
-        if task_details["status"] == "PENDING":
-            task_details["status"] = "RUNNING"
-            logger.info(f"Task assigned to Worker: {job_id}")
-            return {
-                "job_id": job_id,
-                "prompt": task_details["prompt"],
-                "chat_id": task_details["chat_id"]
-            }
-    return {"job_id": None, "prompt": None, "chat_id": None}
+        return {"message": "Task status updated"}
 
-@app.post("/api/update-task")
-async def update_task(update_request: TaskUpdateRequest):
-    """Called by the local Worker to update a task's status"""
-    job = JOBS.get(update_request.job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    job["status"] = update_request.status
-    logger.info(f"Task status updated: {update_request.job_id} -> {update_request.status}")
+    @app.get("/")
+    def health_check():
+        """Root path for health checks"""
+        return {"status": "ok", "service": "Telebot Dispatch Center"}
 
-    if update_request.status == "COMPLETED":
-        await send_telegram_message(job["chat_id"], f"🎉 Your task `{update_request.job_id}` is complete! The file has been sent to you directly by the bot.")
-    elif update_request.status == "FAILED":
-        await send_telegram_message(job["chat_id"], f"Sorry, your task `{update_request.job_id}` has failed.")
-    
-    return {"message": "Task status updated"}
+    # --- Lifecycle events to run on application startup and shutdown ---
+    @app.on_event("startup")
+    async def startup_event():
+        """Runs on application startup"""
+        await telegram_app.initialize()
 
-@app.get("/")
-def health_check():
-    """Root path for health checks"""
-    return {"status": "ok", "service": "Telebot Dispatch Center with Payment"}
+        if not PUBLIC_SERVER_URL:
+            logger.warning("Warning: PUBLIC_SERVER_URL environment variable is not set. Cannot set webhook automatically.")
+            return
 
-# --- Lifecycle events ---
-@app.on_event("startup")
-async def startup_event():
-    """Runs on application startup"""
-    await telegram_app.initialize()
-    webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
-    logger.info(f"Setting Webhook to: {webhook_url}")
-    await telegram_app.bot.set_webhook(url=webhook_url)
+        webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
+        logger.info(f"Setting Webhook to: {webhook_url}")
+        await telegram_app.bot.set_webhook(url=webhook_url)
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Runs on application shutdown"""
-    logger.info("Removing Webhook and shutting down application...")
-    await telegram_app.shutdown()
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Runs on application shutdown"""
+        logger.info("Removing Webhook and shutting down application...")
+        await telegram_app.shutdown()
+
+    提交 (Commit) 您在 GitHub 上的更改。
+
+第二步：简化服务器上的 .env 文件
+
+原始版本的代码不需要任何支付相关的配置。我们需要清理一下 .env 文件。
+
+    SSH 连接到您的服务器，并进入项目目录：
+
+    cd ~/plotbot/tinfernew/
+
+    编辑 .env 文件：
+
+    nano .env
+
+    删除里面所有的内容，只保留以下两行：
+
+    # Telegram Bot Configuration
+    BOT_TOKEN=... (请填入您的真实 Token)
+
+    # Public URL Configuration
+    PUBLIC_SERVER_URL=https://paymentbot.tinfer.ai
+
+    保存并退出 (Ctrl+X -> Y -> Enter)。
+
+第三步：更新并重启服务
+
+现在，我们让服务器上的代码与您刚刚更新的 GitHub 仓库同步，并用这个最简单的版本重启服务。
+
+    从 GitHub 拉取最新代码:
+
+    git pull
+
+    重新构建并启动服务:
+
+    sudo docker-compose up -d --build
+
+完成以上步骤后，您的机器人应该已经恢复到了最初的、可以正常提交任务的状态。请您在 Telegram 中测试 /vtuber 命令，它现在应该会直接提示您任务已提交，不再有任何支付流程。
+
+对于之前给您带来的所有麻烦，我再次表示深深的歉意。希望这次的回退操作能让您的服务先稳定下来。
