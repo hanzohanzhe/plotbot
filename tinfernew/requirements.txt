@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 python-telegram-bot
 httpx
+qrcode
+pypng
