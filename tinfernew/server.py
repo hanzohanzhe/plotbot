@@ -4,6 +4,8 @@ import logging
 import httpx
 import time
 import hashlib
+import random
+import string # <-- Import the string module
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,7 +34,7 @@ if not PUBLIC_SERVER_URL:
 GLOBEPAY_PARTNER_CODE = os.environ.get("GLOBEPAY_PARTNER_CODE")
 GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL")
 PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "1")
-PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP") # Correctly reads PRICE_CURRENCY
+PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP")
 
 if not GLOBEPAY_PARTNER_CODE or not GLOBEPAY_CREDENTIAL:
     raise ValueError("Error: GLOBEPAY_PARTNER_CODE and GLOBEPAY_CREDENTIAL must be set")
@@ -61,6 +63,10 @@ def generate_globepay_signature(params: dict, credential: str) -> str:
     string_to_sign = f"{unsigned_string}&key={credential}"
     return hashlib.md5(string_to_sign.encode('utf-8')).hexdigest().upper()
 
+def generate_nonce_str() -> str:
+    """Generates a 32-character uppercase alphanumeric random string."""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
+
 async def create_payment_qr(job_id: str, description: str) -> str | None:
     """Calls GlobePay API to create a new payment order and returns the QR code content."""
     globepay_api_url = f"https://pay.globepay.co/api/v1.0/gateway/partners/{GLOBEPAY_PARTNER_CODE}/orders/{job_id}"
@@ -68,7 +74,7 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     
     params = {
         "time": str(int(time.time())),
-        "nonce_str": str(uuid.uuid4()),
+        "nonce_str": generate_nonce_str(), # <-- Use the new function to generate nonce_str
         "price": PRICE_AMOUNT,
         "currency": PRICE_CURRENCY,
         "description": description,
@@ -82,8 +88,6 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
             response = await client.put(globepay_api_url, json=params, timeout=30)
             data = response.json()
             
-            # --- ENHANCED LOGGING ---
-            # Log the full response from GlobePay, regardless of success or failure
             logger.info(f"GlobePay API Response for job {job_id}: STATUS={response.status_code}, BODY={data}")
 
             response.raise_for_status()
@@ -224,7 +228,7 @@ async def payment_notify(request: Request):
             
             await send_telegram_message(
                 job["chat_id"],
-                f"🎉 Payment successful!\n\nYour task `{order_id}` is now in the queue to be processed."
+                f"🎉 Payment successful!\n\nYour task `{job_id}` is now in the queue to be processed."
             )
         else:
             logger.warning(f"Received duplicate notification for job: {order_id}, current status: {job['status']}")
