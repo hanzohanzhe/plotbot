@@ -33,7 +33,8 @@ if not PUBLIC_SERVER_URL:
 # --- GlobePay Configuration ---
 GLOBEPAY_PARTNER_CODE = os.environ.get("GLOBEPAY_PARTNER_CODE")
 GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL")
-PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "1")
+# PRICE_AMOUNT is now treated as a string representing the main currency unit (e.g., "1.00" for £1.00)
+PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "0.10") 
 PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP")
 
 if not GLOBEPAY_PARTNER_CODE or not GLOBEPAY_CREDENTIAL:
@@ -75,19 +76,23 @@ async def create_payment_qr(job_id: str) -> str | None:
     globepay_api_url = f"https://pay.globepay.co/api/v1.0/gateway/partners/{GLOBEPAY_PARTNER_CODE}/orders/{job_id}"
     notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
     
+    # **DEFINITIVE FIX**: Convert the price from a float string (e.g., "0.10")
+    # to an integer in the smallest currency unit (e.g., 10 for pence).
+    try:
+        price_in_smallest_unit = int(float(PRICE_AMOUNT) * 100)
+    except ValueError:
+        logger.error(f"Invalid PRICE_AMOUNT format: {PRICE_AMOUNT}. It should be a number string like '1.00'.")
+        return None
+
     params = {
         "time": str(int(time.time() * 1000)),
         "nonce_str": generate_nonce_str(),
-        "price": PRICE_AMOUNT,
+        "price": str(price_in_smallest_unit), # Send as a string integer
         "currency": PRICE_CURRENCY,
-        # **DEFINITIVE FIX 2**: Use a hardcoded, simple, ASCII-only description
-        # that exactly matches the API documentation example to eliminate all variables.
-        "description": "test",
+        "description": "AI Drawing Task", # Use a simple, safe description
         "notify_url": notify_url,
     }
     
-    # **DEFINITIVE FIX 1**: Do NOT include partner_code in the signature calculation,
-    # as it is only part of the URL path, not the request body.
     params['sign'] = generate_globepay_signature(params, GLOBEPAY_CREDENTIAL)
     
     try:
