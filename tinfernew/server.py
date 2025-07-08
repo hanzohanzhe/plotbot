@@ -140,9 +140,10 @@ async def vtuber_command(update: Update, context: CallbackContext):
         logger.error(f"Failed to send static QR code photo: {e}")
         await send_telegram_message(chat_id, "Error: Could not display the payment QR code. Please contact an administrator.")
 
-
+# This is the function for the /dmiu command
 async def dmiu_command(update: Update, context: CallbackContext):
     """Handles the /dmiu command to contact the owner."""
+    # IMPORTANT: Replace "hanzohang" with your actual Telegram username
     my_telegram_username = "hanzohang"
     my_telegram_url = f"https://t.me/{my_telegram_username}"
     text = "Hello! Click the button below to start a direct chat with me (the bot administrator)."
@@ -154,6 +155,7 @@ async def dmiu_command(update: Update, context: CallbackContext):
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
+# Make sure the /dmiu command handler is registered
 telegram_app.add_handler(CommandHandler("dmiu", dmiu_command))
 
 # --- FastAPI Webhook Endpoint ---
