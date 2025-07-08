@@ -18,4 +18,4 @@ COPY . .
 EXPOSE 8000
 
 # 启动应用的命令
-CMD ["uvicorn", "serverfinal:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
