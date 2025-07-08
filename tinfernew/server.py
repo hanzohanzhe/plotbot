@@ -70,23 +70,24 @@ def generate_nonce_str() -> str:
     """Generates a 32-character uppercase alphanumeric random string."""
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=32))
 
-async def create_payment_qr(job_id: str, description: str) -> str | None:
+async def create_payment_qr(job_id: str) -> str | None:
     """Calls GlobePay API to create a new payment order and returns the QR code content."""
     globepay_api_url = f"https://pay.globepay.co/api/v1.0/gateway/partners/{GLOBEPAY_PARTNER_CODE}/orders/{job_id}"
     notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
     
     params = {
-        # **DEFINITIVE FIX**: Add 'partner_code' to the parameters that will be signed.
-        # This is the most likely missing piece for a valid signature.
-        "partner_code": GLOBEPAY_PARTNER_CODE,
         "time": str(int(time.time() * 1000)),
         "nonce_str": generate_nonce_str(),
         "price": PRICE_AMOUNT,
         "currency": PRICE_CURRENCY,
-        "description": description,
+        # **DEFINITIVE FIX 2**: Use a hardcoded, simple, ASCII-only description
+        # that exactly matches the API documentation example to eliminate all variables.
+        "description": "test",
         "notify_url": notify_url,
     }
     
+    # **DEFINITIVE FIX 1**: Do NOT include partner_code in the signature calculation,
+    # as it is only part of the URL path, not the request body.
     params['sign'] = generate_globepay_signature(params, GLOBEPAY_CREDENTIAL)
     
     try:
@@ -165,8 +166,7 @@ async def vtuber_command(update: Update, context: CallbackContext):
     
     await update.message.reply_text("Creating your payment order, please wait...")
 
-    payment_description = f"AI Drawing Task: {job_id}"
-    qr_code_url = await create_payment_qr(job_id, payment_description)
+    qr_code_url = await create_payment_qr(job_id)
 
     if qr_code_url:
         JOBS[job_id] = {
@@ -219,9 +219,7 @@ async def payment_notify(request: Request):
         data = await request.json()
         logger.info(f"Received GlobePay notification: {data}")
 
-        # Re-generate signature for validation, now including partner_code
         params_to_validate = data.copy()
-        params_to_validate['partner_code'] = GLOBEPAY_PARTNER_CODE 
         received_sign = params_to_validate.pop('sign', None)
         
         if generate_globepay_signature(params_to_validate, GLOBEPAY_CREDENTIAL) != received_sign:
