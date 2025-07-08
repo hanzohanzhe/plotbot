@@ -33,8 +33,7 @@ if not PUBLIC_SERVER_URL:
 # --- GlobePay Configuration ---
 GLOBEPAY_PARTNER_CODE = os.environ.get("GLOBEPAY_PARTNER_CODE")
 GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL")
-# PRICE_AMOUNT is now treated as a string representing the main currency unit (e.g., "1.00" for £1.00)
-PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "0.10") 
+PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "1.00") 
 PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP")
 
 if not GLOBEPAY_PARTNER_CODE or not GLOBEPAY_CREDENTIAL:
@@ -76,8 +75,6 @@ async def create_payment_qr(job_id: str) -> str | None:
     globepay_api_url = f"https://pay.globepay.co/api/v1.0/gateway/partners/{GLOBEPAY_PARTNER_CODE}/orders/{job_id}"
     notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
     
-    # **DEFINITIVE FIX**: Convert the price from a float string (e.g., "0.10")
-    # to an integer in the smallest currency unit (e.g., 10 for pence).
     try:
         price_in_smallest_unit = int(float(PRICE_AMOUNT) * 100)
     except ValueError:
@@ -87,9 +84,11 @@ async def create_payment_qr(job_id: str) -> str | None:
     params = {
         "time": str(int(time.time() * 1000)),
         "nonce_str": generate_nonce_str(),
-        "price": str(price_in_smallest_unit), # Send as a string integer
+        "price": str(price_in_smallest_unit),
         "currency": PRICE_CURRENCY,
-        "description": "AI Drawing Task", # Use a simple, safe description
+        # **DEFINITIVE FIX**: Use a single, simple, ASCII word for the description
+        # to completely eliminate any possible encoding issues with spaces or special characters.
+        "description": "Task",
         "notify_url": notify_url,
     }
     
