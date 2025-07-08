@@ -74,7 +74,7 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     
     params = {
         "time": str(int(time.time())),
-        "nonce_str": generate_nonce_str(), # <-- Use the new function to generate nonce_str
+        "nonce_str": generate_nonce_str(),
         "price": PRICE_AMOUNT,
         "currency": PRICE_CURRENCY,
         "description": description,
@@ -153,7 +153,9 @@ async def vtuber_command(update: Update, context: CallbackContext):
         await update.message.reply_text("Please provide a description. For example: `/vtuber a girl wearing a cat-ear hat`")
         return
 
-    job_id = str(uuid.uuid4())
+    # **BUG FIX**: Generate a UUID and remove hyphens to create a clean order_id.
+    job_id = str(uuid.uuid4()).replace('-', '')
+    
     chat_id = update.effective_chat.id
     
     await update.message.reply_text("Creating your payment order, please wait...")
