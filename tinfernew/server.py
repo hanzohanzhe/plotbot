@@ -61,6 +61,10 @@ def generate_globepay_signature(params: dict, credential: str) -> str:
     sorted_params = sorted(filtered_params.items())
     unsigned_string = "&".join([f"{k}={v}" for k, v in sorted_params])
     string_to_sign = f"{unsigned_string}&key={credential}"
+    
+    # **CRITICAL DEBUG LOGGING**: Print the exact string being signed.
+    logger.info(f"String to be signed: {string_to_sign}")
+    
     return hashlib.md5(string_to_sign.encode('utf-8')).hexdigest().upper()
 
 def generate_nonce_str() -> str:
@@ -159,9 +163,9 @@ async def vtuber_command(update: Update, context: CallbackContext):
     
     await update.message.reply_text("Creating your payment order, please wait...")
 
-    # **BUG FIX**: Use a safe, generic, ASCII-only description for the payment
-    # to avoid signature errors caused by special characters in the user's prompt.
-    payment_description = f"AI Drawing Task: {job_id}"
+    # **BUG FIX**: Use a hardcoded, simple, ASCII-only description to eliminate
+    # any possible encoding or special character issues during signature generation.
+    payment_description = "test"
     qr_code_url = await create_payment_qr(job_id, payment_description)
 
     if qr_code_url:
