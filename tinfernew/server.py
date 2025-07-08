@@ -2,10 +2,15 @@ import os
 import uuid
 import logging
 import httpx
+import time
+import hashlib
 from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackContext
+from urllib.parse import urlencode
+import qrcode
+from io import BytesIO
 
 # --- Basic Setup ---
 logging.basicConfig(
@@ -19,7 +24,19 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Error: BOT_TOKEN environment variable must be set")
 
-PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL") # Used to set the webhook
+PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL") # Used to set the webhook and payment callback
+if not PUBLIC_SERVER_URL:
+    raise ValueError("Error: PUBLIC_SERVER_URL environment variable must be set")
+
+# --- GlobePay Configuration ---
+# IMPORTANT: Please set these variables in your server environment
+GLOBEPAY_PARTNER_CODE = os.environ.get("GLOBEPAY_PARTNER_CODE")
+GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL") 
+PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "1") # Default to "1"
+PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP") # Default to "GBP"
+
+if not GLOBEPAY_PARTNER_CODE or not GLOBEPAY_CREDENTIAL:
+    raise ValueError("Error: GLOBEPAY_PARTNER_CODE and GLOBEPAY_CREDENTIAL must be set")
 
 # --- In-memory job storage ---
 JOBS = {}
@@ -34,29 +51,78 @@ class TaskUpdateRequest(BaseModel):
 app = FastAPI()
 
 # --- Telegram Bot Setup ---
-# Create the Application instance using Application.builder()
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-# --- Helper Function ---
-def send_telegram_message(chat_id: int, text: str):
-    """A helper function to send a message to a specified Telegram user."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        response = httpx.post(url, json={'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}, timeout=30)
-        response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Error sending message to chat_id {chat_id}: {e.response.text}")
-    except Exception as e:
-        logger.error(f"An unknown error occurred while sending message: {e}")
+# --- GlobePay Helper Functions ---
+def generate_globepay_signature(params: dict, credential: str) -> str:
+    """Generates an API request signature according to GlobePay documentation."""
+    filtered_params = {k: v for k, v in params.items() if v and k != 'sign'}
+    sorted_params = sorted(filtered_params.items())
+    unsigned_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+    string_to_sign = f"{unsigned_string}&key={credential}"
+    return hashlib.md5(string_to_sign.encode('utf-8')).hexdigest().upper()
 
-# --- Telegram Command Handlers ---
+async def create_payment_qr(job_id: str, description: str) -> str | None:
+    """Calls GlobePay API to create a new payment order and returns the QR code content."""
+    globepay_api_url = f"https://pay.globepay.co/api/v1.0/gateway/partners/{GLOBEPAY_PARTNER_CODE}/orders/{job_id}"
+    notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
+    
+    params = {
+        "time": str(int(time.time())),
+        "nonce_str": str(uuid.uuid4()),
+        "price": PRICE_AMOUNT,
+        "currency": PRICE_CURRENCY,
+        "description": description,
+        "notify_url": notify_url,
+    }
+    
+    params['sign'] = generate_globepay_signature(params, GLOBEPAY_CREDENTIAL)
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.put(globepay_api_url, json=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("result_code") == "SUCCESS":
+                return data.get("code_url")
+            else:
+                logger.error(f"GlobePay API Error for job {job_id}: {data.get('err_code_des')}")
+                return None
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP Error calling GlobePay API for job {job_id}: {e.response.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Unknown Error calling GlobePay API for job {job_id}: {e}")
+        return None
+
+# --- Telegram Helper Functions ---
+async def send_telegram_message(chat_id: int, text: str, reply_markup=None):
+    """A helper function to send a message to a specified Telegram user."""
+    try:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown', reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Error sending message to chat_id {chat_id}: {e}")
+
+async def send_qr_code_image(chat_id: int, qr_data: str, caption: str):
+    """Generates and sends a QR code image."""
+    try:
+        img = qrcode.make(qr_data)
+        bio = BytesIO()
+        bio.name = 'payment_qr.png'
+        img.save(bio, 'PNG')
+        bio.seek(0)
+        await telegram_app.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+    except Exception as e:
+        logger.error(f"Error sending QR code to chat_id {chat_id}: {e}")
+
+# --- Telegram Command Handlers (Unchanged from original where possible) ---
 async def start_command(update: Update, context: CallbackContext):
     """Handles the /start command"""
     welcome_text = (
         "Hello! Welcome to the AI Drawing Bot.\n\n"
         "Use `/vtuber <description>` to submit a drawing task.\n"
         "For example: `/vtuber a silver-haired girl in a white shirt`\n\n"
-        "Your task will be added to the queue, please wait patiently for it to be processed."
+        "After submitting, you will be prompted for payment to start the task."
     )
     await update.message.reply_text(welcome_text)
 
@@ -72,44 +138,51 @@ async def help_command(update: Update, context: CallbackContext):
     await update.message.reply_text(help_text)
 
 async def vtuber_command(update: Update, context: CallbackContext):
-    """Handles the /vtuber command to create a new task"""
+    """Handles the /vtuber command to create a new task and initiate payment"""
     prompt = " ".join(context.args)
     if not prompt:
-        await update.message.reply_text("Please enter your description. For example: `/vtuber a girl wearing a cat-ear hat`")
+        await update.message.reply_text("Please provide a description. For example: `/vtuber a girl wearing a cat-ear hat`")
         return
 
     job_id = str(uuid.uuid4())
-    JOBS[job_id] = {
-        "prompt": prompt,
-        "chat_id": update.effective_chat.id,
-        "status": "PENDING"
-    }
-    send_telegram_message(
-        update.effective_chat.id,
-        f"✅ Task submitted successfully, now waiting in the queue for a compute node...\n\nTask ID: `{job_id}`"
-    )
-    logger.info(f"Task submitted: {job_id} for chat_id {update.effective_chat.id}")
+    chat_id = update.effective_chat.id
+    
+    await update.message.reply_text("Creating your payment order, please wait...")
+    qr_code_url = await create_payment_qr(job_id, prompt)
+
+    if qr_code_url:
+        JOBS[job_id] = {
+            "prompt": prompt,
+            "chat_id": chat_id,
+            "status": "AWAITING_PAYMENT" # New status: waiting for payment
+        }
+        
+        payment_caption = (
+            f"✅ Your order has been created! Please scan the QR code below to complete the payment.\n\n"
+            f"💰 **Amount: {PRICE_AMOUNT} {PRICE_CURRENCY}**\n"
+            f"📝 **Description:** {prompt}\n"
+            f"🆔 **Task ID:** `{job_id}`\n\n"
+            f"Once payment is successful, your task will automatically be queued for processing."
+        )
+        await send_qr_code_image(chat_id, qr_code_url, payment_caption)
+        logger.info(f"Payment order created for job {job_id} for chat_id {chat_id}")
+    else:
+        await send_telegram_message(chat_id, "❌ Sorry, we failed to create a payment order. Please try again later or contact an administrator.")
 
 async def dmiu_command(update: Update, context: CallbackContext):
     """Handles the /dmiu command to contact the owner."""
-    # Your Telegram username is set here
     my_telegram_username = "hanzohang"
     my_telegram_url = f"https://t.me/{my_telegram_username}"
-
     text = "Hello! Click the button below to start a direct chat with me (the bot administrator)."
-    
-    keyboard = [
-        [InlineKeyboardButton("💬 Start Chat", url=my_telegram_url)]
-    ]
+    keyboard = [[InlineKeyboardButton("💬 Start Chat", url=my_telegram_url)]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
     await update.message.reply_text(text, reply_markup=reply_markup)
 
 # --- Register command handlers with the Telegram application ---
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
-telegram_app.add_handler(CommandHandler("dmiu", dmiu_command)) # New command handler
+telegram_app.add_handler(CommandHandler("dmiu", dmiu_command))
 
 # --- FastAPI Webhook Endpoint ---
 @app.post(f"/{BOT_TOKEN}")
@@ -120,7 +193,43 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return Response(status_code=200)
 
-# --- API Endpoint for Workers ---
+# --- NEW: API Endpoint for GlobePay Payment Notifications ---
+@app.post("/api/payment-notify")
+async def payment_notify(request: Request):
+    """This endpoint receives payment success notifications from GlobePay."""
+    try:
+        data = await request.json()
+        logger.info(f"Received GlobePay notification: {data}")
+
+        received_sign = data.get('sign')
+        if generate_globepay_signature(data, GLOBEPAY_CREDENTIAL) != received_sign:
+            logger.warning(f"GlobePay notification signature validation failed: {data}")
+            raise HTTPException(status_code=400, detail="Invalid signature")
+
+        order_id = data.get('order_id')
+        job = JOBS.get(order_id)
+
+        if not job:
+            logger.error(f"Received notification for a non-existent job: {order_id}")
+            return {"result": "success"} # Tell GlobePay we're done
+
+        if job["status"] == "AWAITING_PAYMENT":
+            job["status"] = "PENDING" # Update status to be picked up by worker
+            logger.info(f"Payment successful for job {order_id}. Status updated to PENDING.")
+            
+            await send_telegram_message(
+                job["chat_id"],
+                f"🎉 Payment successful!\n\nYour task `{order_id}` is now in the queue to be processed."
+            )
+        else:
+            logger.warning(f"Received duplicate notification for job: {order_id}, current status: {job['status']}")
+
+        return {"result": "success"} # Must return this string
+    except Exception as e:
+        logger.error(f"Error processing GlobePay notification: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+# --- API Endpoint for Workers (Unchanged) ---
 @app.get("/api/get-task")
 async def get_task():
     """Called by the local Worker to get a pending task"""
@@ -146,9 +255,9 @@ async def update_task(update_request: TaskUpdateRequest):
     logger.info(f"Task status updated: {update_request.job_id} -> {update_request.status}")
 
     if update_request.status == "COMPLETED":
-        send_telegram_message(job["chat_id"], f"🎉 Your task `{update_request.job_id}` is complete! The file has been sent to you directly by the bot.")
+        await send_telegram_message(job["chat_id"], f"🎉 Your task `{update_request.job_id}` is complete! The file has been sent to you directly by the bot.")
     elif update_request.status == "FAILED":
-        send_telegram_message(job["chat_id"], f"Sorry, your task `{update_request.job_id}` has failed.")
+        await send_telegram_message(job["chat_id"], f"Sorry, your task `{update_request.job_id}` has failed.")
     
     return {"message": "Task status updated"}
 
@@ -162,7 +271,6 @@ def health_check():
 async def startup_event():
     """Runs on application startup"""
     await telegram_app.initialize()
-
     if not PUBLIC_SERVER_URL:
         logger.warning("Warning: PUBLIC_SERVER_URL environment variable is not set. Cannot set webhook automatically.")
         return
