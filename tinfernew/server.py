@@ -73,7 +73,8 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     notify_url = f"{PUBLIC_SERVER_URL}/api/payment-notify"
     
     params = {
-        "time": str(int(time.time())),
+        # **BUG FIX**: Convert timestamp from seconds to milliseconds as required by GlobePay API.
+        "time": str(int(time.time() * 1000)),
         "nonce_str": generate_nonce_str(),
         "price": PRICE_AMOUNT,
         "currency": PRICE_CURRENCY,
@@ -85,8 +86,7 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     
     try:
         async with httpx.AsyncClient() as client:
-            # **BUG FIX**: Send data as application/x-www-form-urlencoded, not as JSON.
-            # This is the crucial change that matches the GlobePay API documentation.
+            # Send data as application/x-www-form-urlencoded, not as JSON.
             response = await client.put(globepay_api_url, data=params, timeout=30)
             
             data = response.json()
