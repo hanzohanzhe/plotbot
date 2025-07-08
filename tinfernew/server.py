@@ -24,16 +24,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Error: BOT_TOKEN environment variable must be set")
 
-PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL") # Used to set the webhook and payment callback
+PUBLIC_SERVER_URL = os.environ.get("PUBLIC_SERVER_URL")
 if not PUBLIC_SERVER_URL:
     raise ValueError("Error: PUBLIC_SERVER_URL environment variable must be set")
 
 # --- GlobePay Configuration ---
-# IMPORTANT: Please set these variables in your server environment
 GLOBEPAY_PARTNER_CODE = os.environ.get("GLOBEPAY_PARTNER_CODE")
-GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL") 
-PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "1") # Default to "1"
-PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP") # Default to "GBP"
+GLOBEPAY_CREDENTIAL = os.environ.get("GLOBEPAY_CREDENTIAL")
+PRICE_AMOUNT = os.environ.get("PRICE_AMOUNT", "1")
+PRICE_CURRENCY = os.environ.get("PRICE_CURRENCY", "GBP") # Correctly reads PRICE_CURRENCY
 
 if not GLOBEPAY_PARTNER_CODE or not GLOBEPAY_CREDENTIAL:
     raise ValueError("Error: GLOBEPAY_PARTNER_CODE and GLOBEPAY_CREDENTIAL must be set")
@@ -45,7 +44,7 @@ JOBS = {}
 class TaskUpdateRequest(BaseModel):
     job_id: str
     status: str
-    result_url: str | None = None # Kept for compatibility, can be null
+    result_url: str | None = None
 
 # --- FastAPI application instance ---
 app = FastAPI()
@@ -81,18 +80,24 @@ async def create_payment_qr(job_id: str, description: str) -> str | None:
     try:
         async with httpx.AsyncClient() as client:
             response = await client.put(globepay_api_url, json=params, timeout=30)
-            response.raise_for_status()
             data = response.json()
+            
+            # --- ENHANCED LOGGING ---
+            # Log the full response from GlobePay, regardless of success or failure
+            logger.info(f"GlobePay API Response for job {job_id}: STATUS={response.status_code}, BODY={data}")
+
+            response.raise_for_status()
+            
             if data.get("result_code") == "SUCCESS":
                 return data.get("code_url")
             else:
-                logger.error(f"GlobePay API Error for job {job_id}: {data.get('err_code_des')}")
+                logger.error(f"GlobePay returned a non-SUCCESS result_code for job {job_id}.")
                 return None
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP Error calling GlobePay API for job {job_id}: {e.response.text}")
         return None
     except Exception as e:
-        logger.error(f"Unknown Error calling GlobePay API for job {job_id}: {e}")
+        logger.error(f"Unknown Error calling GlobePay API for job {job_id}: {e}", exc_info=True)
         return None
 
 # --- Telegram Helper Functions ---
@@ -115,7 +120,7 @@ async def send_qr_code_image(chat_id: int, qr_data: str, caption: str):
     except Exception as e:
         logger.error(f"Error sending QR code to chat_id {chat_id}: {e}")
 
-# --- Telegram Command Handlers (Unchanged from original where possible) ---
+# --- Telegram Command Handlers ---
 async def start_command(update: Update, context: CallbackContext):
     """Handles the /start command"""
     welcome_text = (
@@ -154,7 +159,7 @@ async def vtuber_command(update: Update, context: CallbackContext):
         JOBS[job_id] = {
             "prompt": prompt,
             "chat_id": chat_id,
-            "status": "AWAITING_PAYMENT" # New status: waiting for payment
+            "status": "AWAITING_PAYMENT"
         }
         
         payment_caption = (
@@ -178,7 +183,7 @@ async def dmiu_command(update: Update, context: CallbackContext):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(text, reply_markup=reply_markup)
 
-# --- Register command handlers with the Telegram application ---
+# --- Register command handlers ---
 telegram_app.add_handler(CommandHandler("start", start_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
 telegram_app.add_handler(CommandHandler("vtuber", vtuber_command))
@@ -193,7 +198,7 @@ async def telegram_webhook(request: Request):
     await telegram_app.process_update(update)
     return Response(status_code=200)
 
-# --- NEW: API Endpoint for GlobePay Payment Notifications ---
+# --- API Endpoint for GlobePay Payment Notifications ---
 @app.post("/api/payment-notify")
 async def payment_notify(request: Request):
     """This endpoint receives payment success notifications from GlobePay."""
@@ -211,10 +216,10 @@ async def payment_notify(request: Request):
 
         if not job:
             logger.error(f"Received notification for a non-existent job: {order_id}")
-            return {"result": "success"} # Tell GlobePay we're done
+            return {"result": "success"}
 
         if job["status"] == "AWAITING_PAYMENT":
-            job["status"] = "PENDING" # Update status to be picked up by worker
+            job["status"] = "PENDING"
             logger.info(f"Payment successful for job {order_id}. Status updated to PENDING.")
             
             await send_telegram_message(
@@ -224,12 +229,12 @@ async def payment_notify(request: Request):
         else:
             logger.warning(f"Received duplicate notification for job: {order_id}, current status: {job['status']}")
 
-        return {"result": "success"} # Must return this string
+        return {"result": "success"}
     except Exception as e:
         logger.error(f"Error processing GlobePay notification: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
-# --- API Endpoint for Workers (Unchanged) ---
+# --- API Endpoint for Workers ---
 @app.get("/api/get-task")
 async def get_task():
     """Called by the local Worker to get a pending task"""
@@ -264,17 +269,13 @@ async def update_task(update_request: TaskUpdateRequest):
 @app.get("/")
 def health_check():
     """Root path for health checks"""
-    return {"status": "ok", "service": "Telebot Dispatch Center"}
+    return {"status": "ok", "service": "Telebot Dispatch Center with Payment"}
 
-# --- Lifecycle events to run on application startup and shutdown ---
+# --- Lifecycle events ---
 @app.on_event("startup")
 async def startup_event():
     """Runs on application startup"""
     await telegram_app.initialize()
-    if not PUBLIC_SERVER_URL:
-        logger.warning("Warning: PUBLIC_SERVER_URL environment variable is not set. Cannot set webhook automatically.")
-        return
-    
     webhook_url = f"{PUBLIC_SERVER_URL}/{BOT_TOKEN}"
     logger.info(f"Setting Webhook to: {webhook_url}")
     await telegram_app.bot.set_webhook(url=webhook_url)
